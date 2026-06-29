@@ -143,6 +143,7 @@ static ALLOWED_SVG_ELEMENTS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| 
     "linearGradient",
     "marker",
     "mask",
+    "metadata",
     "meshgradient",
     "meshpatch",
     "meshrow",
@@ -185,18 +186,26 @@ pub struct Filter {
     image_filter: Option<Box<dyn for<'a> Fn(&'a DataUrl<'a>) -> DataUrlFilterResult>>,
     /// HTTP header
     content_type: Option<String>,
+    /// Preserve C2PA manifest and XMP data inside <metadata>
+    preserve_c2pa: bool,
 }
 
 impl Filter {
     /// Create new filter instance. Call [`Filter::filter`] on it.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sort_attributes: true,
             strip_prefixes: true,
             image_filter: None,
             content_type: None,
+            preserve_c2pa: false,
         }
+    }
+
+        /// Preserve C2PA manifests and XMP data inside `<metadata>` elements.
+    pub fn set_preserve_c2pa(&mut self, preserve: bool) {
+        self.preserve_c2pa = preserve;
     }
 
     /// If parsing SVG from HTTP, provide the value of the HTTP header to read encoding from.
@@ -241,7 +250,10 @@ impl Filter {
             .pad_self_closing(false)
             .create_writer(destination);
 
-        let mut skipping = 0;
+        let mut skipping = 0u32;
+        let mut in_metadata = 0u32;
+        let mut in_c2pa_manifest = 0u32;
+        let mut in_xpacket = false;
         let mut accumulating_css_text: Option<String> = None;
         let mut rewrite = Vec::new();
         let mut reached_document_end = false;
@@ -259,6 +271,32 @@ impl Filter {
                         continue;
                     }
 
+                    if in_metadata > 0 {
+                        if in_xpacket || in_c2pa_manifest > 0 {
+                            // inside xpacket or c2pa:manifest, pass through verbatim
+                            if in_c2pa_manifest > 0 { in_c2pa_manifest += 1; }
+                            emitted_any_element = true;
+                            let keep: Vec<_> = attributes.iter().map(|a| (*a).borrow()).collect();
+                            writer.write(WEvent::StartElement {
+                                name: (*name).borrow(),
+                                attributes: keep.into(),
+                                namespace: Cow::Borrowed(&*namespace),
+                            })?;
+                        } else if self.preserve_c2pa && name.namespace.as_deref() == Some("http://c2pa.org/manifest") {
+                            in_c2pa_manifest += 1;
+                            emitted_any_element = true;
+                            let keep: Vec<_> = attributes.iter().map(|a| (*a).borrow()).collect();
+                            writer.write(WEvent::StartElement {
+                                name: (*name).borrow(),
+                                attributes: keep.into(),
+                                namespace: Cow::Borrowed(&*namespace),
+                            })?;
+                        } else {
+                            skipping += 1;
+                        }
+                        continue;
+                    }
+
                     match self.is_allowed_element(name.borrow()) {
                         ElementAction::Keep => {},
                         ElementAction::FilterCSS if accumulating_css_text.is_none() => {
@@ -268,6 +306,10 @@ impl Filter {
                             skipping += 1;
                             continue;
                         }
+                    }
+
+                    if name.local_name == "metadata" {
+                        in_metadata += 1;
                     }
 
                     let mut keep = Vec::with_capacity(attributes.len());
@@ -312,6 +354,27 @@ impl Filter {
                         skipping -= 1;
                         continue;
                     }
+                    if in_xpacket || in_c2pa_manifest > 1 {
+                        if in_c2pa_manifest > 1 { in_c2pa_manifest -= 1; }
+                        writer.write(WEvent::EndElement {
+                            name: Some((*name).borrow()),
+                        })?;
+                        continue;
+                    }
+                    if in_c2pa_manifest == 1 {
+                        in_c2pa_manifest -= 1;
+                        writer.write(WEvent::EndElement {
+                            name: Some((*name).borrow()),
+                        })?;
+                        continue;
+                    }
+                    if in_metadata > 1 {
+                        in_metadata -= 1;
+                        continue;
+                    }
+                    if in_metadata == 1 {
+                        in_metadata -= 1;
+                    }
                     if self.strip_prefixes {
                         name.prefix = None;
                     }
@@ -342,13 +405,24 @@ impl Filter {
                     break;
                 }
 
-                REvent::ProcessingInstruction { .. } => continue,
+                REvent::ProcessingInstruction { name, data } => {
+                    if self.preserve_c2pa && in_metadata > 0 && name == "xpacket" {
+                        in_xpacket = !data.as_deref().is_some_and(|d| d.contains("end="));
+                        writer.write(WEvent::ProcessingInstruction {
+                            name,
+                            data: data.as_deref(),
+                        })?;
+                    }
+                    continue;
+                }
                 REvent::CData(_) | REvent::Comment(_) => unreachable!(),
                 REvent::Characters(c) | REvent::Whitespace(c) => {
                     if skipping > 0 {
                         continue;
                     }
-                    if let Some(css) = &mut accumulating_css_text {
+                    if in_c2pa_manifest > 0 || in_xpacket {
+                        WEvent::Characters(c)
+                    } else if let Some(css) = &mut accumulating_css_text {
                         css.push_str(c);
                         WEvent::Characters("")
                     } else {
