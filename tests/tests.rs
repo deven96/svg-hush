@@ -1,4 +1,35 @@
 use svg_hush::*;
+use xml::reader::{EventReader, XmlEvent};
+use base64::engine::Engine as _;
+
+fn extract_c2pa_manifest_bytes(svg: &[u8]) -> Vec<u8> {
+    let parser = EventReader::new(svg);
+    let mut in_manifest = false;
+    let mut content = String::new();
+
+    for event in parser {
+        match event.unwrap() {
+            XmlEvent::StartElement { name, .. }
+                if name.namespace.as_deref() == Some("http://c2pa.org/manifest") =>
+            {
+                in_manifest = true;
+            }
+            XmlEvent::Characters(s) if in_manifest => {
+                content.push_str(&s);
+            }
+            XmlEvent::EndElement { name }
+                if name.namespace.as_deref() == Some("http://c2pa.org/manifest") =>
+            {
+                in_manifest = false;
+            }
+            _ => {}
+        }
+    }
+
+    base64::engine::general_purpose::STANDARD
+        .decode(content.trim())
+        .expect("c2pa:manifest content is not valid base64")
+}
 
 // Minimal SVG with a C2PA manifest embedded the same way c2patool does it:
 // <metadata><c2pa:manifest>...</c2pa:manifest><?xpacket ...?>XMP<?xpacket end="w"?></metadata>
@@ -100,12 +131,27 @@ fn c2pa_real_fixture_preserved() {
     let mut out = Vec::new();
     f.filter(&mut svg.as_slice(), &mut out).unwrap();
     let out_str = std::str::from_utf8(&out).unwrap();
-    assert!(
-        out_str.contains("c2pa:manifest"),
-        "c2pa:manifest was stripped from real fixture"
-    );
-    assert!(
-        out_str.contains("xpacket"),
-        "XMP xpacket was stripped from real fixture"
+    assert!(out_str.contains("c2pa:manifest"), "c2pa:manifest was stripped from real fixture");
+    assert!(out_str.contains("xpacket"), "XMP xpacket was stripped from real fixture");
+}
+
+#[test]
+fn c2pa_manifest_jumbf_bytes_survive_filtering() {
+    let svg = std::fs::read("tests/sample1_c2pa.svg").unwrap();
+
+    let original_jumbf = extract_c2pa_manifest_bytes(&svg);
+    assert!(!original_jumbf.is_empty(), "fixture has no c2pa:manifest content");
+
+    let mut f = Filter::new();
+    f.set_preserve_c2pa(true);
+    let mut filtered = Vec::new();
+    f.filter(&mut svg.as_slice(), &mut filtered).unwrap();
+
+    let filtered_jumbf = extract_c2pa_manifest_bytes(&filtered);
+
+    assert_eq!(
+        original_jumbf, filtered_jumbf,
+        "JUMBF bytes changed after filtering, c2pa SDK would read a different manifest"
     );
 }
+
